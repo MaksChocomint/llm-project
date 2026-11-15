@@ -1,9 +1,94 @@
 """Цикл агента. Требования FR-7, FR-8, FR-9 и FR-10."""
 
+import json
 from collections.abc import Callable
 
-from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import AgentResult
+from assistant.agent.tools import TOOL_SCHEMAS
+from assistant.infra.erp_client import ErpUnavailable
+from assistant.infra.llm import LLMClient, ToolCall, tool_message
+from assistant.infra.schemas import AgentResult, ToolStep
+
+NOT_FOUND = "в базе знаний не найдено"
+ERP_FAILED = "Данные ERP получить не удалось."
+SYSTEM = (
+    "Ты ассистент диспетчера сервисной службы «ПолярТех». Отвечай кратко по-русски. "
+    "Номер детали узнавай только инструментом search_knowledge: передай ему вопрос с моделью и кодом ошибки "
+    "или названием узла. Если деталь заменена, работай с последней деталью цепочки замен. "
+    "Остаток детали узнавай инструментом check_stock, цену – get_price. Обзорные вопросы о частоте отказов "
+    "задавай summarize_topic. Заказ оформляй create_service_order только когда пользователь просит заказ "
+    "и сам назвал количество. Никогда не придумывай номера деталей, цены и остатки: пиши только то, что "
+    "вернули инструменты. Если инструмент вернул ошибку «данных нет», так и скажи. "
+    f"Если данных нет, ответь: «{NOT_FOUND}»."
+)
+
+
+def _summary(steps: list[ToolStep]) -> str:
+    known = [
+        f"{step.tool}({json.dumps(step.args, ensure_ascii=False)}) -> {json.dumps(step.result, ensure_ascii=False)}"
+        for step in steps
+        if step.error is None and step.result is not None
+    ]
+    return "; ".join(known) if known else "ничего"
+
+
+class _Run:
+    """Состояние одного диалога агента."""
+
+    def __init__(self, question: str, tools: dict[str, Callable[..., dict]], confirm: bool) -> None:
+        self.question = question
+        self.tools = tools
+        self.confirm = confirm
+        self.steps: list[ToolStep] = []
+        self.sources: list[str] = []
+        self.tool_texts: list[str] = []
+        self.erp_failed = False
+        self.kb_refused = False
+        self.not_found = False  # ERP ответила «данных нет»
+        self.order_id: str | None = None
+
+    @property
+    def tool_text(self) -> str:
+        return "\n".join(self.tool_texts)
+
+    def result(self, answer: str, **kwargs) -> AgentResult:
+        return AgentResult(answer, steps=self.steps, sources=self.sources, **kwargs)
+
+    def _record(self, name: str, args: dict, result: dict | None, error: str | None) -> dict:
+        self.steps.append(ToolStep(name, args, result, error))
+        return result if result is not None else {"error": error}
+
+    def execute(self, call: ToolCall) -> dict:
+        name, args = call.name, call.arguments
+        if name not in self.tools:
+            return self._record(name, args, None, f"неизвестный инструмент {name!r}, доступны: {', '.join(self.tools)}")
+        if "_raw" in args:
+            return self._record(name, args, None, "аргументы не разобраны как JSON-объект, повторите вызов")
+
+        result, error = self._run_tool(name, args)
+        return self._record(name, args, result, error)
+
+    def _run_tool(self, name: str, args: dict) -> tuple[dict | None, str | None]:
+        try:
+            result = self.tools[name](**args)
+        except ErpUnavailable as exc:
+            self.erp_failed = True
+            return None, f"ERP недоступна: {exc}"
+        except TypeError as exc:
+            return None, f"неверные аргументы: {exc}"
+
+        if not isinstance(result, dict):
+            result = {"result": result}
+        self.tool_texts.append(json.dumps(result, ensure_ascii=False))
+        for source in result.get("sources", []) or []:
+            if source not in self.sources:
+                self.sources.append(source)
+        if result.get("outcome") == "not_found":
+            self.not_found = True
+        if name == "search_knowledge" and result.get("refused"):
+            self.kb_refused = True
+        if name == "create_service_order" and result.get("order_id"):
+            self.order_id = str(result["order_id"])
+        return result, result.get("error")
 
 
 def run_agent(
@@ -24,5 +109,32 @@ def run_agent(
     и `pending_action`. Перед выдачей ответа коды, цены и остатки сверяются с вопросом
     и результатами инструментов.
     """
-    # TODO: цикл, проверки аргументов, повторы, подтверждение, проверка итогового ответа
-    raise NotImplementedError("Реализуйте run_agent")
+    run = _Run(question, tools, confirm)
+    messages: list[dict] = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
+
+    while True:
+        reply = llm.chat(messages, tools=TOOL_SCHEMAS)
+        if not reply.tool_calls:
+            return _finish(run, reply.content.strip())
+        messages.append(reply.as_message())
+        for call in reply.tool_calls:
+            if len(run.steps) >= max_steps:
+                return run.result(
+                    f"Работа прервана: исчерпан лимит в {max_steps} вызовов инструментов. "
+                    f"Что удалось узнать: {_summary(run.steps)}."
+                )
+            observation = run.execute(call)
+            messages.append(tool_message(call, observation))
+
+
+def _finish(run: _Run, answer: str) -> AgentResult:
+    if run.erp_failed and "не удалось" not in answer.lower():
+        answer = f"{answer} {ERP_FAILED}".strip()
+    if run.order_id and run.order_id not in answer:
+        answer = f"{answer} Номер заказа: {run.order_id}."
+    lowered = answer.lower()
+    no_data = any(marker in lowered for marker in ("не найден", "данных нет", "неизвестн", "не заведен"))
+    refused = NOT_FOUND in lowered or ((run.kb_refused or run.not_found) and no_data)
+    if refused and NOT_FOUND not in lowered:
+        answer = f"{NOT_FOUND.capitalize()}. {answer}"
+    return run.result(answer, refused=refused)
