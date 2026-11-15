@@ -2,8 +2,10 @@
 
 from collections.abc import Callable
 
-from assistant.agent.validation import WAREHOUSES
-from assistant.infra.erp_client import ErpClient
+from assistant.agent.validation import WAREHOUSES, check_order
+from assistant.agent.validation import part_id as normalize_part
+from assistant.graphrag.search import global_search, local_search
+from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import KnowledgeBase
 
@@ -65,6 +67,21 @@ TOOL_SCHEMAS: list[dict] = [
 ]
 
 
+def _erp_error(exc: Exception, part: str) -> dict:
+    if isinstance(exc, ErpNotFound):
+        return {"error": f"данных нет: деталь {part} не заведена в ERP ({exc})", "outcome": "not_found"}
+    return {"error": f"ERP отклонила запрос: {exc}", "outcome": "rejected"}
+
+
+def _discontinued_note(result: dict) -> dict:
+    if result.get("discontinued"):
+        return {
+            **result,
+            "note": "деталь снята с производства, заказ невозможен: найдите замену через search_knowledge",
+        }
+    return result
+
+
 def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, Callable[..., dict]]:
     """Словарь «имя инструмента -> функция». Каждая функция возвращает словарь.
 
@@ -73,5 +90,52 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
     `ErpNotFound` и `ErpRejected` превращаются в {"error": "..."} с разным текстом, чтобы исходы
     оставались различимыми. `ErpUnavailable` передаётся дальше: повторы делает агент (FR-8).
     """
-    # TODO: пять функций поверх local_search, global_search и клиента ERP
-    raise NotImplementedError("Реализуйте build_tools")
+
+    def search_knowledge(question=None, **_) -> dict:
+        if not isinstance(question, str) or not question.strip():
+            return {"error": "нужен непустой вопрос question"}
+        answer = local_search(question, kb, llm)
+        return {"answer": answer.text, "facts": answer.facts, "sources": answer.sources, "refused": answer.refused}
+
+    def summarize_topic(question=None, **_) -> dict:
+        if not isinstance(question, str) or not question.strip():
+            return {"error": "нужен непустой вопрос question"}
+        answer = global_search(question, kb, llm)
+        return {"answer": answer.text, "sources": answer.sources, "refused": answer.refused}
+
+    def check_stock(part_id=None, warehouse=None, **_) -> dict:
+        part = normalize_part(part_id)
+        if part is None:
+            return {"error": f"неверный номер детали {part_id!r}: нужен вид P-1042 или P-1042B"}
+        if warehouse not in WAREHOUSES:
+            return {"error": f"неизвестный склад {warehouse!r}: допустимы {', '.join(WAREHOUSES)}"}
+        try:
+            return _discontinued_note(erp.get_stock(part, warehouse))
+        except (ErpNotFound, ErpRejected) as exc:
+            return _erp_error(exc, part)
+
+    def get_price(part_id=None, **_) -> dict:
+        part = normalize_part(part_id)
+        if part is None:
+            return {"error": f"неверный номер детали {part_id!r}: нужен вид P-1042 или P-1042B"}
+        try:
+            return _discontinued_note(erp.get_price(part))
+        except (ErpNotFound, ErpRejected) as exc:
+            return _erp_error(exc, part)
+
+    def create_service_order(**arguments) -> dict:
+        order, error = check_order(arguments)
+        if error:
+            return {"error": error}
+        try:
+            return erp.create_order(order["part_id"], order["warehouse"], order["qty"], order["model"])
+        except (ErpNotFound, ErpRejected) as exc:
+            return _erp_error(exc, order["part_id"])
+
+    return {
+        "search_knowledge": search_knowledge,
+        "summarize_topic": summarize_topic,
+        "check_stock": check_stock,
+        "get_price": get_price,
+        "create_service_order": create_service_order,
+    }
