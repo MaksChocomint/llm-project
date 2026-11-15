@@ -44,7 +44,24 @@ def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
         if current is None or len(chunks) > len(current[1]):
             best[(source, target)] = (kind, chunks)
 
+    conflicts = 0
+    removed: set[tuple[str, str]] = set()
+    for (source, target), (kind, chunks) in sorted(best.items()):
+        back = best.get((target, source))
+        if kind != "REPLACED_BY" or back is None or back[0] != "REPLACED_BY" or (source, target) in removed:
+            continue
+        if source > target:
+            continue  # каждую встречную пару разбираем один раз
+        conflicts += 1
+        forward_weight, backward_weight = len(chunks), len(back[1])
+        if forward_weight >= backward_weight:
+            removed.add((target, source))
+        if backward_weight >= forward_weight:
+            removed.add((source, target))
+
     for (source, target), (kind, chunks) in best.items():
+        if (source, target) in removed:
+            continue
         graph.add_edge(source, target, type=kind, weight=len(chunks), sources=sorted(chunks))
-    graph.graph["conflicts"] = 0
+    graph.graph["conflicts"] = conflicts
     return graph
