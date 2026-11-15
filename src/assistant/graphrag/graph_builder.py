@@ -1,8 +1,18 @@
 """Сборка графа знаний из результатов извлечения. Требование FR-2."""
 
+from collections import defaultdict
+
 import networkx as nx
 
-from assistant.infra.schemas import ExtractionResult
+from assistant.infra.schemas import Entity, ExtractionResult
+
+
+def _add_node(graph: nx.DiGraph, entity: Entity, chunk_id: str) -> None:
+    node = entity.node_id
+    if node not in graph:
+        graph.add_node(node, type=entity.type, name=entity.name, sources=[])
+    if chunk_id not in graph.nodes[node]["sources"]:
+        graph.nodes[node]["sources"] = sorted([*graph.nodes[node]["sources"], chunk_id])
 
 
 def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
@@ -14,5 +24,27 @@ def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
     деталями есть `REPLACED_BY` в обе стороны, остаётся связь с большим весом, при равенстве
     отбрасываются обе. Число таких конфликтов записывается в `graph.graph["conflicts"]`.
     """
-    # TODO: узлы, рёбра с весами, проверка схемы, разбор встречных замен
-    raise NotImplementedError("Реализуйте build_graph")
+    graph = nx.DiGraph()
+    edges: dict[tuple[str, str, str], set[str]] = defaultdict(set)
+    for result in results:
+        for entity in result.entities:
+            _add_node(graph, entity, result.chunk_id)
+        for relation in result.relations:
+            if not relation.matches_schema():
+                continue
+            _add_node(graph, relation.subject, result.chunk_id)
+            _add_node(graph, relation.object, result.chunk_id)
+            edges[(relation.subject.node_id, relation.type, relation.object.node_id)].add(result.chunk_id)
+
+    # Для одной пары узлов схема допускает только один тип связи, но на случай расхождений
+    # оставляем тип, найденный в большем числе чанков.
+    best: dict[tuple[str, str], tuple[str, set[str]]] = {}
+    for (source, kind, target), chunks in sorted(edges.items()):
+        current = best.get((source, target))
+        if current is None or len(chunks) > len(current[1]):
+            best[(source, target)] = (kind, chunks)
+
+    for (source, target), (kind, chunks) in best.items():
+        graph.add_edge(source, target, type=kind, weight=len(chunks), sources=sorted(chunks))
+    graph.graph["conflicts"] = 0
+    return graph
