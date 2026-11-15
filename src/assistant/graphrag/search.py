@@ -1,12 +1,13 @@
 """Два режима поиска по графу. Требования FR-4, FR-5 и FR-10."""
 
+import json
 from itertools import combinations
 
 import networkx as nx
 
 from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import Answer, KnowledgeBase
+from assistant.infra.schemas import MAP_SCHEMA, Answer, KnowledgeBase
 
 NOT_FOUND = "в базе знаний не найдено"
 MAX_FACT_CHARS = 8000
@@ -23,6 +24,16 @@ LOCAL_SYSTEM = (
     "Коды пиши точно как в фактах. Если деталь заменена, называй последнюю деталь цепочки замен как ту, "
     "которую нужно заказывать сейчас, и её поставщика. "
     f"Если в фактах нет ответа, напиши: «{NOT_FOUND}»."
+)
+MAP_SYSTEM = (
+    "Ты анализируешь сводку одной части графа знаний сервисной службы «ПолярТех». Верни JSON: answer – "
+    "частичный ответ на вопрос только по этой сводке, с числами и кодами из неё; score – полезность сводки "
+    "для ответа от 0 до 10. Если сводка не помогает ответить, верни score 0."
+)
+REDUCE_SYSTEM = (
+    "Ты ассистент сервисной службы «ПолярТех». Объедини частичные ответы по разным сводкам в один краткий "
+    "итоговый ответ: опирайся только на них, больше доверяй ответам с высокой полезностью, коды пиши точно. "
+    f"Если ни один частичный ответ не отвечает на вопрос, напиши «{NOT_FOUND}»."
 )
 
 
@@ -205,6 +216,19 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     return Answer(text or f"{NOT_FOUND.capitalize()}.", sources=sources, facts=facts, refused=refused)
 
 
+def _parse_map(content: str) -> dict | None:
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("answer"), str):
+        return None
+    score = data.get("score")
+    if isinstance(score, bool) or not isinstance(score, int | float):
+        return None
+    return {"answer": data["answer"].strip(), "score": max(0, min(10, int(score)))}
+
+
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """Отвечает на обзорный вопрос по сводкам сообществ в два шага.
 
@@ -212,5 +236,44 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Шаг reduce: частичные ответы с оценкой выше 0 объединяются в итоговый ответ.
     Если таких ответов нет, возвращается `Answer(..., refused=True)`.
     """
-    # TODO: частичные ответы по сводкам, объединение
-    raise NotImplementedError("Реализуйте global_search")
+    partial: list[tuple[int, str, int]] = []
+    for community in kb.communities:
+        if not community.summary.strip():
+            continue
+        reply = llm.chat(
+            [
+                {"role": "system", "content": MAP_SYSTEM},
+                {"role": "user", "content": f"Сводка:\n{community.summary}\n\nВопрос: {question}"},
+            ],
+            json_schema=MAP_SCHEMA,
+            max_tokens=300,
+        )
+        parsed = _parse_map(reply.content)
+        if parsed and parsed["score"] > 0 and parsed["answer"]:
+            partial.append((parsed["score"], parsed["answer"], community.community_id))
+    if not partial:
+        return Answer(f"{NOT_FOUND.capitalize()}.", refused=True)
+
+    partial.sort(key=lambda item: -item[0])
+    listed = "\n".join(f"{i}. (полезность {score}) {answer}" for i, (score, answer, _) in enumerate(partial, 1))
+    reply = llm.chat(
+        [
+            {"role": "system", "content": REDUCE_SYSTEM},
+            {"role": "user", "content": f"Частичные ответы:\n{listed}\n\nВопрос: {question}"},
+        ]
+    )
+    text = reply.content.strip()
+
+    by_id = {community.community_id: community for community in kb.communities}
+    sources: list[str] = []
+    facts: list[str] = []
+    for _, answer, community_id in partial:
+        facts.append(answer)
+        nodes = set(by_id[community_id].nodes)
+        for source, target, attrs in kb.graph.edges(data=True):
+            if source in nodes or target in nodes:
+                for chunk_id in attrs.get("sources", []):
+                    if _doc(chunk_id) not in sources:
+                        sources.append(_doc(chunk_id))
+    refused = NOT_FOUND in text.lower() or not text
+    return Answer(text or f"{NOT_FOUND.capitalize()}.", sources=sources, facts=facts, refused=refused)
