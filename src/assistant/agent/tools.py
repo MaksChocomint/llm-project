@@ -101,6 +101,12 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
         if not isinstance(question, str) or not question.strip():
             return {"error": "нужен непустой вопрос question"}
         answer = global_search(question, kb, llm)
+        if answer.refused:
+            # Модель иногда отправляет сюда точный вопрос («по какому регламенту…»). Сводки на него не
+            # отвечают, а граф отвечает, поэтому пробуем точный поиск, прежде чем отказать.
+            exact = local_search(question, kb, llm)
+            if not exact.refused:
+                return {"answer": exact.text, "facts": exact.facts, "sources": exact.sources, "refused": False}
         return {"answer": answer.text, "sources": answer.sources, "refused": answer.refused}
 
     def check_stock(part_id=None, warehouse=None, **_) -> dict:
