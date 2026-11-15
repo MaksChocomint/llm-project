@@ -43,6 +43,9 @@ _NUMBER_WORDS = {
     "десять": 10,
 }
 _CODE_LIKE = re.compile(r"[A-Za-zА-Яа-яЁё]{1,2}[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?(?![\dA-Za-zА-Яа-яЁё])")
+_AMOUNT = r"(?<![\w-])(\d{1,3}(?:[   ]\d{3})+|\d+)(?![\w-])"
+_WITH_UNIT = re.compile(_AMOUNT + r"\s*(?:руб|₽|шт)", re.IGNORECASE)
+_AFTER_WORD = re.compile(r"(?:цен[аеуы]|стоимост\w*|остат\w*|налич\w*)\D{0,20}?" + _AMOUNT, re.IGNORECASE)
 
 
 def named_quantities(question: str) -> set[int]:
@@ -51,6 +54,21 @@ def named_quantities(question: str) -> set[int]:
     numbers = {int(raw) for raw in re.findall(r"(?<!\d)\d+(?!\d)", text)}
     numbers |= {value for word, value in _NUMBER_WORDS.items() if re.search(rf"\b{word}\b", text.lower())}
     return numbers
+
+
+def _digits(raw: str) -> str:
+    return re.sub(r"\D", "", raw)
+
+
+def ungrounded(answer: str, question: str, tool_text: str) -> list[str]:
+    """Коды, цены и остатки ответа, которых нет ни в вопросе, ни в результатах инструментов."""
+    allowed_codes = set(find_codes(question)) | set(find_codes(tool_text))
+    allowed_numbers = set(re.findall(r"\d+", tool_text)) | set(re.findall(r"\d+", question))
+    problems = [code for code in find_codes(answer) if code not in allowed_codes]
+    for raw in _WITH_UNIT.findall(answer) + _AFTER_WORD.findall(answer):
+        if _digits(raw) not in allowed_numbers:
+            problems.append(_digits(raw))
+    return list(dict.fromkeys(problems))
 
 
 def _call_key(name: str, args: dict) -> str:
@@ -202,7 +220,7 @@ def run_agent(
     while True:
         reply = llm.chat(messages, tools=TOOL_SCHEMAS)
         if not reply.tool_calls:
-            return _finish(run, reply.content.strip())
+            return _finish(run, llm, messages, reply.content.strip())
         messages.append(reply.as_message())
         for call in reply.tool_calls:
             if len(run.steps) >= max_steps:
@@ -216,7 +234,27 @@ def run_agent(
             messages.append(tool_message(call, observation))
 
 
-def _finish(run: _Run, answer: str) -> AgentResult:
+def _finish(run: _Run, llm: LLMClient, messages: list[dict], answer: str) -> AgentResult:
+    for attempt in range(2):
+        problems = ungrounded(answer, run.question, run.tool_text)
+        if not problems and answer:
+            break
+        if attempt == 1:
+            return run.result(
+                f"{NOT_FOUND.capitalize()}: ответ не удалось подтвердить данными инструментов.", refused=True
+            )
+        messages.append({"role": "assistant", "content": answer})
+        issue = f"В ответе есть данные, которых нет в вопросе и результатах инструментов: {', '.join(problems)}. "
+        if not answer:
+            issue = "Ответ пустой. "
+        messages.append(
+            {
+                "role": "user",
+                "content": issue + "Исправь ответ: используй только данные из результатов инструментов.",
+            }
+        )
+        answer = llm.chat(messages).content.strip()
+
     if run.erp_failed and "не удалось" not in answer.lower():
         answer = f"{answer} {ERP_FAILED}".strip()
     if run.order_id and run.order_id not in answer:
