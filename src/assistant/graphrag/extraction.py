@@ -3,7 +3,7 @@
 import json
 
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import canonical_name
+from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import (
     ENTITY_TYPES,
@@ -117,12 +117,17 @@ def _parse(content: str) -> tuple[list[dict], list[dict]] | None:
     return entities, relations
 
 
-def _ground(entity_type: str, raw: str, vocab: dict[str, list[str]]) -> Entity | None:
-    """Каноническая сущность: код правильного вида или название из словаря, иначе None."""
+def _ground(entity_type: str, raw: str, in_text: set[str], vocab: dict[str, list[str]]) -> Entity | None:
+    """Каноническая сущность, подтверждённая текстом чанка или словарём, иначе None.
+
+    in_text – коды, которые встречаются в тексте чанка.
+    """
     if entity_type not in ENTITY_TYPES:
         return None
     name = canonical_name(entity_type, raw, vocab)
     if name is None:
+        return None
+    if entity_type in CODE_TYPES and name not in in_text:
         return None
     return Entity(entity_type, name)
 
@@ -149,10 +154,11 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         return ExtractionResult(chunk.chunk_id, chunk.doc_id)
 
     raw_entities, raw_relations = parsed
+    in_text = set(find_codes(chunk.text))
     dropped = 0
     entities: dict[str, Entity] = {}
     for item in raw_entities:
-        entity = _ground(item["type"], item["name"], vocab)
+        entity = _ground(item["type"], item["name"], in_text, vocab)
         if entity is None:
             dropped += 1
         else:
@@ -160,8 +166,8 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
 
     relations: dict[tuple, Relation] = {}
     for item in raw_relations:
-        subject = _ground(item["subject_type"], item["subject"], vocab)
-        obj = _ground(item["object_type"], item["object"], vocab)
+        subject = _ground(item["subject_type"], item["subject"], in_text, vocab)
+        obj = _ground(item["object_type"], item["object"], in_text, vocab)
         relation = Relation(subject, item["type"], obj) if subject and obj else None
         if relation is None or not relation.matches_schema() or subject == obj:
             dropped += 1
