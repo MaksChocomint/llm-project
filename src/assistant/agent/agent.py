@@ -1,9 +1,11 @@
 """Цикл агента. Требования FR-7, FR-8, FR-9 и FR-10."""
 
 import json
+import re
 from collections.abc import Callable
 
 from assistant.agent.tools import TOOL_SCHEMAS
+from assistant.agent.validation import check_order
 from assistant.infra.erp_client import ErpUnavailable
 from assistant.infra.llm import LLMClient, ToolCall, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
@@ -20,6 +22,33 @@ SYSTEM = (
     "вернули инструменты. Если инструмент вернул ошибку «данных нет», так и скажи. "
     f"Если данных нет, ответь: «{NOT_FOUND}»."
 )
+
+_NUMBER_WORDS = {
+    "один": 1,
+    "одну": 1,
+    "одна": 1,
+    "два": 2,
+    "две": 2,
+    "пару": 2,
+    "пара": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+}
+_CODE_LIKE = re.compile(r"[A-Za-zА-Яа-яЁё]{1,2}[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?(?![\dA-Za-zА-Яа-яЁё])")
+
+
+def named_quantities(question: str) -> set[int]:
+    """Числа, которые пользователь назвал в вопросе, без цифр внутри кодов."""
+    text = _CODE_LIKE.sub(" ", question)
+    numbers = {int(raw) for raw in re.findall(r"(?<!\d)\d+(?!\d)", text)}
+    numbers |= {value for word, value in _NUMBER_WORDS.items() if re.search(rf"\b{word}\b", text.lower())}
+    return numbers
 
 
 def _summary(steps: list[ToolStep]) -> str:
@@ -41,10 +70,12 @@ class _Run:
         self.steps: list[ToolStep] = []
         self.sources: list[str] = []
         self.tool_texts: list[str] = []
+        self.discontinued: set[str] = set()
         self.erp_failed = False
         self.kb_refused = False
         self.not_found = False  # ERP ответила «данных нет»
         self.order_id: str | None = None
+        self.stop: AgentResult | None = None  # досрочный результат: подтверждение или уточнение
 
     @property
     def tool_text(self) -> str:
@@ -64,6 +95,29 @@ class _Run:
         if "_raw" in args:
             return self._record(name, args, None, "аргументы не разобраны как JSON-объект, повторите вызов")
 
+        if name == "create_service_order":
+            order, error = check_order(args)
+            if error:
+                return self._record(name, args, None, error)
+            if order["qty"] not in named_quantities(self.question):
+                self._record(name, args, None, "количество не названо пользователем")
+                self.stop = self.result(
+                    f"Сколько штук детали {order['part_id']} заказать для {order['model']} на склад "
+                    f"{order['warehouse']}? Укажите количество."
+                )
+                return {"error": "количество не названо пользователем"}
+            if order["part_id"] in self.discontinued:
+                return self._record(name, args, None, f"деталь {order['part_id']} снята с производства: найдите замену")
+            if not self.confirm:
+                self._record(name, args, None, "ожидает подтверждения человека, заказ не создан")
+                self.stop = self.result(
+                    f"Подготовлен заказ: деталь {order['part_id']}, {order['qty']} шт., склад {order['warehouse']}, "
+                    f"модель {order['model']}. Заказ будет создан после подтверждения.",
+                    needs_confirmation=True,
+                    pending_action={"tool": name, "args": order},
+                )
+                return {"status": "pending_confirmation"}
+
         result, error = self._run_tool(name, args)
         return self._record(name, args, result, error)
 
@@ -82,6 +136,8 @@ class _Run:
         for source in result.get("sources", []) or []:
             if source not in self.sources:
                 self.sources.append(source)
+        if result.get("discontinued") and isinstance(result.get("part_id"), str):
+            self.discontinued.add(result["part_id"])
         if result.get("outcome") == "not_found":
             self.not_found = True
         if name == "search_knowledge" and result.get("refused"):
@@ -124,6 +180,8 @@ def run_agent(
                     f"Что удалось узнать: {_summary(run.steps)}."
                 )
             observation = run.execute(call)
+            if run.stop is not None:
+                return run.stop
             messages.append(tool_message(call, observation))
 
 
