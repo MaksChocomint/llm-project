@@ -112,8 +112,21 @@ def _part_details(graph: nx.DiGraph, part: str) -> list[tuple[str, str]]:
     return edges
 
 
+def _undirected(graph: nx.DiGraph) -> nx.Graph:
+    """Неориентированная копия графа с детерминированным порядком соседей.
+
+    `graph.to_undirected(as_view=True)` объединяет соседей через множество, и их порядок зависит
+    от PYTHONHASHSEED. Тогда порядок фактов в запросе меняется от запуска к запуску, запрос
+    не попадает в кеш и метрики не воспроизводятся. Здесь узлы и рёбра добавляются по порядку.
+    """
+    undirected = nx.Graph()
+    undirected.add_nodes_from(sorted(graph.nodes))
+    undirected.add_edges_from(sorted(graph.edges))
+    return undirected
+
+
 def _path_edges(graph: nx.DiGraph, anchors: list[str]) -> list[tuple[str, str]]:
-    undirected = graph.to_undirected(as_view=True)
+    undirected = _undirected(graph)
     edges: list[tuple[str, str]] = []
     for a, b in combinations(anchors, 2):
         for path in nx.all_simple_paths(undirected, a, b, cutoff=PATH_CUTOFF):
@@ -122,7 +135,7 @@ def _path_edges(graph: nx.DiGraph, anchors: list[str]) -> list[tuple[str, str]]:
 
 
 def _neighbourhood_edges(graph: nx.DiGraph, anchor: str, depth: int) -> list[tuple[str, str]]:
-    undirected = graph.to_undirected(as_view=True)
+    undirected = _undirected(graph)
     distance = nx.single_source_shortest_path_length(undirected, anchor, cutoff=depth)
     edges = []
     for node, dist in sorted(distance.items(), key=lambda item: item[1]):
