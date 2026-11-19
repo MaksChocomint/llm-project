@@ -97,11 +97,33 @@ def _system_prompt(vocab: dict[str, list[str]]) -> str:
     )
 
 
+def _load_truncated(content: str) -> object:
+    """Достаёт целые объекты из JSON, обрезанного по лимиту токенов.
+
+    Длинные руководства дают сотни связей, и ответ может оборваться посреди списка. Тогда текст
+    обрезается по последней закрывающей фигурной скобке и дописываются недостающие скобки.
+    """
+    end = len(content)
+    for _ in range(50):
+        end = content.rfind("}", 0, end)
+        if end < 0:
+            return None
+        head = content[: end + 1]
+        tail = "]}" if '"relations"' in head else '], "relations": []}'
+        try:
+            return json.loads(head + tail)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _parse(content: str) -> tuple[list[dict], list[dict]] | None:
     """Разбирает ответ модели. None, если ответ не соответствует схеме."""
     try:
         data = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError:
+        data = _load_truncated(content)
+    except TypeError:
         return None
     if not isinstance(data, dict):
         return None
@@ -148,8 +170,13 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     ]
     reply = llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=4096)
     parsed = _parse(reply.content)
-    if parsed is None:  # одна повторная попытка
-        parsed = _parse(llm.chat(messages, json_schema=EXTRACTION_SCHEMA, max_tokens=4096).content)
+    if parsed is None:
+        # Повтор с пояснением: тот же запрос при temperature=0 вернул бы тот же ответ из кеша.
+        retry = messages + [
+            {"role": "assistant", "content": reply.content[:2000]},
+            {"role": "user", "content": "Ответ не разобрался. Верни один JSON-объект с полями entities и relations."},
+        ]
+        parsed = _parse(llm.chat(retry, json_schema=EXTRACTION_SCHEMA, max_tokens=4096).content)
     if parsed is None:
         return ExtractionResult(chunk.chunk_id, chunk.doc_id)
 
