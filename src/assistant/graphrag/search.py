@@ -1,17 +1,21 @@
 """Два режима поиска по графу. Требования FR-4, FR-5 и FR-10."""
 
 import json
+import re
 from itertools import combinations
 
 import networkx as nx
 
-from assistant.infra.grounding import code_type, find_codes, find_names
+from assistant.infra.grounding import code_type, find_codes, find_names, normalize_code
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import MAP_SCHEMA, Answer, KnowledgeBase
 
 NOT_FOUND = "в базе знаний не найдено"
 MAX_FACT_CHARS = 8000
 PATH_CUTOFF = 3
+# Похожее на код, но неправильного вида: SP-1044 вместо SP-104. find_codes такие строки пропускает молча,
+# поэтому искажённый моделью код не ловится обычной сверкой кодов.
+_CODE_SHAPED = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё])(?:AR|BZ|GS|SP|P|E)-\d+[A-Z]?(?![0-9A-Za-zА-Яа-яЁё])")
 # Порядок важности связей, когда фактов больше, чем помещается в запрос.
 PRIORITY = ["REPLACED_BY", "FIXED_BY", "INDICATES", "SUPPLIED_BY", "IS_A", "BELONGS_TO", "HAS_PART", "FAILED"]
 
@@ -43,6 +47,11 @@ def _doc(chunk_id: str) -> str:
 
 def _name(graph: nx.DiGraph, node: str) -> str:
     return graph.nodes[node].get("name", node.split(":", 1)[-1])
+
+
+def malformed_codes(text: str) -> list[str]:
+    """Строки вида кода, которые не являются правильным кодом."""
+    return [raw for raw in _CODE_SHAPED.findall(text) if normalize_code(raw) is None]
 
 
 def find_anchors(question: str, kb: KnowledgeBase) -> tuple[list[str], list[str]]:
@@ -212,6 +221,21 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         {"role": "user", "content": f"{context}\n\nВопрос: {question}"},
     ]
     text = llm.chat(messages).content.strip()
+    # Малая модель иногда искажает код (SP-104 -> SP-1044). Код, которого нет ни в фактах, ни в вопросе,
+    # возвращается модели на исправление один раз, затем ответ заменяется отказом.
+    allowed = set(find_codes(question)) | set(find_codes(context))
+    wrong = [code for code in find_codes(text) if code not in allowed] + malformed_codes(text)
+    if wrong:
+        messages += [
+            {"role": "assistant", "content": text},
+            {
+                "role": "user",
+                "content": f"Кодов {', '.join(wrong)} нет в фактах. Исправь ответ: коды пиши точно как в фактах.",
+            },
+        ]
+        text = llm.chat(messages).content.strip()
+        if any(code not in allowed for code in find_codes(text)) or malformed_codes(text):
+            return Answer(f"{NOT_FOUND.capitalize()}.", sources=sources, facts=facts, refused=True)
     refused = NOT_FOUND in text.lower() or not text
     return Answer(text or f"{NOT_FOUND.capitalize()}.", sources=sources, facts=facts, refused=refused)
 
