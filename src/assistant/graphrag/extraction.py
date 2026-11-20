@@ -3,7 +3,7 @@
 import json
 
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
+from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import (
     ENTITY_TYPES,
@@ -143,17 +143,23 @@ def _parse(content: str) -> tuple[list[dict], list[dict]] | None:
     return entities, relations
 
 
+# Линейки и поставщики в документах всегда названы в именительном падеже, поэтому их, как и коды,
+# можно сверить с текстом чанка. Без этой проверки модель приписывала модели линейку из примера
+# в запросе или угадывала её в отчётах о выезде, где линейка не названа.
+TEXT_CHECKED = ("ProductLine", "Supplier")
+
+
 def _ground(entity_type: str, raw: str, in_text: set[str], vocab: dict[str, list[str]]) -> Entity | None:
     """Каноническая сущность, подтверждённая текстом чанка или словарём, иначе None.
 
-    in_text – коды, которые встречаются в тексте чанка.
+    in_text – коды и словарные названия, которые встречаются в тексте чанка.
     """
     if entity_type not in ENTITY_TYPES:
         return None
     name = canonical_name(entity_type, raw, vocab)
     if name is None:
         return None
-    if entity_type in CODE_TYPES and name not in in_text:
+    if (entity_type in CODE_TYPES or entity_type in TEXT_CHECKED) and name not in in_text:
         return None
     return Entity(entity_type, name)
 
@@ -185,7 +191,7 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
         return ExtractionResult(chunk.chunk_id, chunk.doc_id)
 
     raw_entities, raw_relations = parsed
-    in_text = set(find_codes(chunk.text))
+    in_text = set(find_codes(chunk.text)) | {name for _, name in find_names(chunk.text, vocab)}
     dropped = 0
     entities: dict[str, Entity] = {}
     for item in raw_entities:
