@@ -61,6 +61,36 @@ def community_facts(community: Community, graph: nx.DiGraph) -> list[str]:
     members = [node for node in community.nodes if node in graph]
     lines: list[str] = []
 
+    # Отказы по линейкам: линейка входит в сообщество, модели могут лежать в других.
+    for line in (node for node in members if _type(graph, node) == "ProductLine"):
+        models = sorted(
+            source for source, _, attrs in graph.in_edges(line, data=True) if attrs.get("type") == "BELONGS_TO"
+        )
+        by_component: Counter = Counter()
+        by_model: Counter = Counter()
+        for model in models:
+            for component, weight in _out(graph, model, "FAILED"):
+                by_component[_name(graph, component)] += weight
+                by_model[_name(graph, model)] += weight
+        lines.append(f"Линейка «{_name(graph, line)}»: модели {', '.join(_name(graph, m) for m in models) or 'нет'}.")
+        if by_component:
+            top = ", ".join(f"{name} – {count}" for name, count in by_component.most_common())
+            lines.append(f"Отказы узлов в линейке «{_name(graph, line)}» по отчётам: {top}.")
+            models_top = ", ".join(f"{name} – {count}" for name, count in by_model.most_common())
+            lines.append(f"Отказы по моделям линейки «{_name(graph, line)}»: {models_top}.")
+        replaced = sorted(
+            {
+                _name(graph, part)
+                for model in models
+                for part, _ in _out(graph, model, "HAS_PART")
+                if _out(graph, part, "REPLACED_BY")
+            }
+        )
+        if replaced:
+            lines.append(
+                f"Сняты с производства детали из руководств линейки «{_name(graph, line)}»: {', '.join(replaced)}."
+            )
+
     # Замены деталей.
     for part in (node for node in members if _type(graph, node) == "Part"):
         has_parent = any(attrs.get("type") == "REPLACED_BY" for _, _, attrs in graph.in_edges(part, data=True))
@@ -116,9 +146,11 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
     facts = community_facts(community, graph)
     prompt = (
         "Ниже подсчёты по фрагменту графа знаний сервисной службы «ПолярТех», сделанные кодом. Напиши по ним "
-        f"сводку не длиннее {MAX_WORDS} слов: какие линейки, модели, узлы, детали и поставщики входят во "
-        "фрагмент, как они связаны и что встречается чаще всего. Числа и коды переноси точно, ничего не "
-        "пересчитывай.\n\n"
+        f"сводку не длиннее {MAX_WORDS} слов: что входит во фрагмент, как связано и что встречается чаще "
+        "всего. Пиши только о том, что есть в подсчётах: если линеек или моделей в подсчётах нет, не "
+        "упоминай их и не придумывай примеров. Числа и коды переноси точно, вместе с линейкой, моделью или "
+        "узлом, к которым они относятся; фразы о линейке пиши с её названием, например «детали из "
+        "руководств линейки «…» сняты с производства: …». Ничего не пересчитывай.\n\n"
         "Подсчёты:\n" + "\n".join(f"- {line}" for line in facts)
     )
     reply = llm.chat([{"role": "user", "content": prompt}], max_tokens=400)
