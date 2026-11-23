@@ -5,11 +5,13 @@ import re
 from collections.abc import Callable
 
 from assistant.agent.tools import TOOL_SCHEMAS
-from assistant.agent.validation import check_order
+from assistant.agent.validation import check_order, part_id
 from assistant.infra.erp_client import ErpUnavailable
+from assistant.infra.grounding import code_type, find_codes
 from assistant.infra.llm import LLMClient, ToolCall, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
+ERP_ATTEMPTS = 3
 NOT_FOUND = "в базе знаний не найдено"
 ERP_FAILED = "Данные ERP получить не удалось."
 SYSTEM = (
@@ -51,6 +53,10 @@ def named_quantities(question: str) -> set[int]:
     return numbers
 
 
+def _call_key(name: str, args: dict) -> str:
+    return json.dumps([name, args], ensure_ascii=False, sort_keys=True)
+
+
 def _summary(steps: list[ToolStep]) -> str:
     known = [
         f"{step.tool}({json.dumps(step.args, ensure_ascii=False)}) -> {json.dumps(step.result, ensure_ascii=False)}"
@@ -69,7 +75,9 @@ class _Run:
         self.confirm = confirm
         self.steps: list[ToolStep] = []
         self.sources: list[str] = []
+        self.cache: dict[str, tuple[dict | None, str | None]] = {}
         self.tool_texts: list[str] = []
+        self.known_parts = {code for code in find_codes(question) if code_type(code) == "Part"}
         self.discontinued: set[str] = set()
         self.erp_failed = False
         self.kb_refused = False
@@ -95,6 +103,22 @@ class _Run:
         if "_raw" in args:
             return self._record(name, args, None, "аргументы не разобраны как JSON-объект, повторите вызов")
 
+        if "part_id" in args:
+            part = part_id(args.get("part_id"))
+            if part is None or part not in self.known_parts:
+                return self._record(
+                    name,
+                    args,
+                    None,
+                    f"номер детали {args.get('part_id')!r} не встречался ни в вопросе, ни в результатах "
+                    "инструментов. Сначала вызовите search_knowledge, чтобы узнать номер детали",
+                )
+
+        key = _call_key(name, args)
+        if key in self.cache:
+            result, error = self.cache[key]
+            return self._record(name, args, result, error)
+
         if name == "create_service_order":
             order, error = check_order(args)
             if error:
@@ -119,20 +143,27 @@ class _Run:
                 return {"status": "pending_confirmation"}
 
         result, error = self._run_tool(name, args)
+        self.cache[key] = (result, error)
         return self._record(name, args, result, error)
 
     def _run_tool(self, name: str, args: dict) -> tuple[dict | None, str | None]:
-        try:
-            result = self.tools[name](**args)
-        except ErpUnavailable as exc:
+        last = ""
+        for _ in range(ERP_ATTEMPTS):
+            try:
+                result = self.tools[name](**args)
+                break
+            except ErpUnavailable as exc:
+                last = str(exc)
+            except TypeError as exc:
+                return None, f"неверные аргументы: {exc}"
+        else:
             self.erp_failed = True
-            return None, f"ERP недоступна: {exc}"
-        except TypeError as exc:
-            return None, f"неверные аргументы: {exc}"
+            return None, f"ERP недоступна после {ERP_ATTEMPTS} попыток: {last}"
 
         if not isinstance(result, dict):
             result = {"result": result}
         self.tool_texts.append(json.dumps(result, ensure_ascii=False))
+        self.known_parts |= {code for code in find_codes(self.tool_text) if code_type(code) == "Part"}
         for source in result.get("sources", []) or []:
             if source not in self.sources:
                 self.sources.append(source)
