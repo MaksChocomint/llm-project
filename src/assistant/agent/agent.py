@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 from assistant.agent.tools import TOOL_SCHEMAS
 from assistant.agent.validation import check_order, part_id
+from assistant.graphrag.search import malformed_codes
 from assistant.infra.erp_client import ErpUnavailable
 from assistant.infra.grounding import code_type, find_codes
 from assistant.infra.llm import LLMClient, ToolCall, tool_message
@@ -14,14 +15,33 @@ from assistant.infra.schemas import AgentResult, ToolStep
 ERP_ATTEMPTS = 3
 NOT_FOUND = "в базе знаний не найдено"
 ERP_FAILED = "Данные ERP получить не удалось."
+ORDER_NUDGE = (
+    "Пользователь просит оформить заказ, а create_service_order не вызван. Вызови create_service_order с "
+    "найденной деталью (последней в цепочке замен), складом, количеством и моделью из вопроса. Не пиши, что "
+    "заказ оформлен, пока инструмент этого не подтвердил."
+)
+_ORDER_REQUEST = re.compile(r"(оформ|созда|сдела|размест)\w*\s+(мне\s+)?заказ|^\s*закажи", re.IGNORECASE)
+
+
+def _asks_for_order(question: str) -> bool:
+    return bool(_ORDER_REQUEST.search(question))
+
+
+NUDGE = (
+    "Ты не вызвал ни одного инструмента. Сначала найди ответ инструментом: факты о моделях, деталях, ошибках и "
+    "поставщиках – search_knowledge, остатки и цены – check_stock и get_price, обзорные вопросы – summarize_topic."
+)
+
 SYSTEM = (
-    "Ты ассистент диспетчера сервисной службы «ПолярТех». Отвечай кратко по-русски. "
+    "Ты ассистент диспетчера сервисной службы «ПолярТех». Отвечай кратко по-русски и всегда называй номер "
+    "детали, о которой идёт речь. "
     "Номер детали узнавай только инструментом search_knowledge: передай ему вопрос с моделью и кодом ошибки "
     "или названием узла. Если деталь заменена, работай с последней деталью цепочки замен. "
     "Остаток детали узнавай инструментом check_stock, цену – get_price. Обзорные вопросы о частоте отказов "
     "задавай summarize_topic. Заказ оформляй create_service_order только когда пользователь просит заказ "
     "и сам назвал количество. Никогда не придумывай номера деталей, цены и остатки: пиши только то, что "
-    "вернули инструменты. Если инструмент вернул ошибку «данных нет», так и скажи. "
+    "вернули инструменты, цену в формате «<цена из get_price> руб.», остаток в формате "
+    "«<qty из check_stock> шт.». Если инструмент вернул ошибку «данных нет», так и скажи. "
     f"Если данных нет, ответь: «{NOT_FOUND}»."
 )
 
@@ -64,7 +84,7 @@ def ungrounded(answer: str, question: str, tool_text: str) -> list[str]:
     """Коды, цены и остатки ответа, которых нет ни в вопросе, ни в результатах инструментов."""
     allowed_codes = set(find_codes(question)) | set(find_codes(tool_text))
     allowed_numbers = set(re.findall(r"\d+", tool_text)) | set(re.findall(r"\d+", question))
-    problems = [code for code in find_codes(answer) if code not in allowed_codes]
+    problems = [code for code in find_codes(answer) if code not in allowed_codes] + malformed_codes(answer)
     for raw in _WITH_UNIT.findall(answer) + _AFTER_WORD.findall(answer):
         if _digits(raw) not in allowed_numbers:
             problems.append(_digits(raw))
@@ -216,9 +236,24 @@ def run_agent(
     """
     run = _Run(question, tools, confirm)
     messages: list[dict] = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
+    nudged = False
+    order_nudged = False
 
     while True:
         reply = llm.chat(messages, tools=TOOL_SCHEMAS)
+        if not reply.tool_calls and not run.steps and not nudged:
+            # Ответ «из головы» без единого инструмента: один раз просим сначала свериться с базой знаний.
+            nudged = True
+            messages.append({"role": "assistant", "content": reply.content})
+            messages.append({"role": "user", "content": NUDGE})
+            continue
+        if not reply.tool_calls and _asks_for_order(question) and not order_nudged and run.steps:
+            if not any(step.tool == "create_service_order" for step in run.steps):
+                # Пользователь просил оформить заказ, а модель закончила без create_service_order.
+                order_nudged = True
+                messages.append({"role": "assistant", "content": reply.content})
+                messages.append({"role": "user", "content": ORDER_NUDGE})
+                continue
         if not reply.tool_calls:
             return _finish(run, llm, messages, reply.content.strip())
         messages.append(reply.as_message())
@@ -250,7 +285,8 @@ def _finish(run: _Run, llm: LLMClient, messages: list[dict], answer: str) -> Age
         messages.append(
             {
                 "role": "user",
-                "content": issue + "Исправь ответ: используй только данные из результатов инструментов.",
+                "content": issue + "Исправь ответ: используй только данные из результатов инструментов. "
+                f"Результаты инструментов: {_summary(run.steps)}",
             }
         )
         answer = llm.chat(messages).content.strip()
