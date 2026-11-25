@@ -101,33 +101,11 @@ def _system_prompt(vocab: dict[str, list[str]]) -> str:
     )
 
 
-def _load_truncated(content: str) -> object:
-    """Достаёт целые объекты из JSON, обрезанного по лимиту токенов.
-
-    Длинные руководства дают сотни связей, и ответ может оборваться посреди списка. Тогда текст
-    обрезается по последней закрывающей фигурной скобке и дописываются недостающие скобки.
-    """
-    end = len(content)
-    for _ in range(50):
-        end = content.rfind("}", 0, end)
-        if end < 0:
-            return None
-        head = content[: end + 1]
-        tail = "]}" if '"relations"' in head else '], "relations": []}'
-        try:
-            return json.loads(head + tail)
-        except json.JSONDecodeError:
-            continue
-    return None
-
-
 def _parse(content: str) -> tuple[list[dict], list[dict]] | None:
     """Разбирает ответ модели. None, если ответ не соответствует схеме."""
     try:
         data = json.loads(content)
-    except json.JSONDecodeError:
-        data = _load_truncated(content)
-    except TypeError:
+    except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(data, dict):
         return None
