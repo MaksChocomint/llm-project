@@ -3,7 +3,7 @@
     "mode": "agent",
     "model": "qwen3:4b-instruct-2507-q4_K_M",
     "questions": 24,
-    "accuracy": 0.958,
+    "accuracy": 1.0,
     "by_type": {
       "local": {
         "questions": 5,
@@ -19,7 +19,7 @@
       },
       "tool": {
         "questions": 5,
-        "accuracy": 0.8
+        "accuracy": 1.0
       },
       "refusal": {
         "questions": 3,
@@ -1675,8 +1675,8 @@
       "id": "dev-19",
       "type": "tool",
       "question": "Сколько стоит деталь узла «контроллер» для модели BZ-110?",
-      "answer": "17210 руб.",
-      "correct": false,
+      "answer": "P-2022: 17210 руб.",
+      "correct": true,
       "refused": false,
       "fabricated": [],
       "sources": [
