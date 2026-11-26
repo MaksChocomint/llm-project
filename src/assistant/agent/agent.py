@@ -237,6 +237,45 @@ class _Run:
         return result, result.get("error")
 
 
+_PRICE_REQUEST = re.compile(r"\b(?:цен[ауые]|стоимост[ьи]|сколько\s+стоит|поч[её]м)\b", re.IGNORECASE)
+_SKIP_PRICE = re.compile(
+    r"\b(?:без\s+(?:цены|стоимости)|(?:цен[ау]|стоимость)\s+не\s+(?:нуж\w*|указывай\w*)"
+    r"|не\s+(?:указывай\w*|проверяй\w*|нужна)\s+(?:цен[ау]|стоимость))\b",
+    re.IGNORECASE,
+)
+
+
+def _complete_price(run: _Run, result: AgentResult, max_steps: int) -> AgentResult:
+    """Дополняет неполный ответ ценой однозначно выбранной детали."""
+    if result.refused or not _PRICE_REQUEST.search(run.question) or _SKIP_PRICE.search(run.question):
+        return result
+    if any(step.tool == "get_price" for step in run.steps):
+        return result
+
+    search_answers = [
+        step.result.get("answer", "")
+        for step in run.steps
+        if step.tool == "search_knowledge" and step.result and not step.error and not step.result.get("refused")
+    ]
+    for text in (result.answer, run.question, " ".join(search_answers)):
+        parts = run.known_parts.intersection(find_codes(text))
+        if parts:
+            break
+    if len(parts) != 1:
+        return result
+    part = parts.pop()
+    if len(run.steps) >= max_steps:
+        result.answer += f" Цена {part} не проверена: исчерпан лимит шагов."
+        return result
+
+    observation = run.execute(ToolCall("missing-price", "get_price", {"part_id": part}))
+    if "price_rub" in observation and not observation.get("error"):
+        result.answer += f" Цена {part}: {observation['price_rub']} руб."
+    else:
+        result.answer += f" Получить цену {part} не удалось: {observation.get('error') or 'нет данных о цене'}."
+    return result
+
+
 def run_agent(
     question: str,
     llm: LLMClient,
@@ -276,7 +315,8 @@ def run_agent(
                 messages.append({"role": "user", "content": ORDER_NUDGE})
                 continue
         if not reply.tool_calls:
-            return _finish(run, llm, messages, reply.content.strip())
+            result = _finish(run, llm, messages, reply.content.strip())
+            return _complete_price(run, result, max_steps)
         messages.append(reply.as_message())
         for call in reply.tool_calls:
             if len(run.steps) >= max_steps:

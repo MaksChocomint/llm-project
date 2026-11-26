@@ -46,6 +46,28 @@ def test_price_only_reply_identifies_the_part_found_by_search():
     assert answer == "P-1042B: 2630 руб."
 
 
+@pytest.mark.parametrize(
+    ("question", "max_steps", "expected_calls"),
+    [
+        ("Найди артикул для AR-210. Какова его цена?", 2, 1),
+        ("Найди артикул для AR-210. Какова его цена?", 1, 0),
+        ("Найди артикул для AR-210. Цена не нужна.", 2, 0),
+    ],
+)
+def test_missing_price_after_part_search(question, max_steps, expected_calls):
+    tools = Tools()
+    llm = FakeLLM([call("search_knowledge", question=question), "Артикул P-1042B."])
+    result = run_agent(question, llm, tools.as_dict(), max_steps=max_steps)
+    assert tools.count("get_price") == expected_calls
+    if expected_calls:
+        assert result.steps[-1].args == {"part_id": "P-1042B"}
+        assert "2630 руб." in result.answer
+    elif max_steps == 1:
+        assert "лимит" in result.answer
+    else:
+        assert result.answer == "Артикул P-1042B."
+
+
 @pytest.mark.parametrize("retry, expected_relations", [(GOOD, 3), (GOOD[:-4], 0)])
 def test_truncation_after_complete_objects_still_requires_retry(retry, expected_relations):
     llm = FakeLLM([GOOD[:-4], retry])
