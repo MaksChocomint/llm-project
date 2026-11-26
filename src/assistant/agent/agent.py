@@ -3,6 +3,7 @@
 import json
 import re
 from collections.abc import Callable
+from decimal import Decimal
 
 from assistant.agent.tools import TOOL_SCHEMAS
 from assistant.agent.validation import check_order, part_id
@@ -62,32 +63,52 @@ _NUMBER_WORDS = {
     "девять": 9,
     "десять": 10,
 }
-_CODE_LIKE = re.compile(r"[A-Za-zА-Яа-яЁё]{1,2}[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?(?![\dA-Za-zА-Яа-яЁё])")
-_AMOUNT = r"(?<![\w-])(\d{1,3}(?:[   ]\d{3})+|\d+)(?![\w-])"
-_WITH_UNIT = re.compile(_AMOUNT + r"\s*(?:руб|₽|шт)", re.IGNORECASE)
-_AFTER_WORD = re.compile(r"(?:цен[аеуы]|стоимост\w*|остат\w*|налич\w*)\D{0,20}?" + _AMOUNT, re.IGNORECASE)
+_COUNT = r"(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+|" + "|".join(_NUMBER_WORDS) + ")"
+_ORDER_COUNT = re.compile(
+    rf"(?<![\w.,/–-])(?P<count>{_COUNT})\s*(?:шт\b|штук\w*\b|единиц\w*\b|детал(?:и|ей|ь)\b|P-\d{{4}})"
+    rf"|\b(?:количество|количестве)\s*[:=]?\s*(?P<labelled>{_COUNT})\b(?![.,]\d)"
+    rf"|\b(?:закажи(?:те)?|заказать|заказ\s+на)\s+(?P<direct>{_COUNT})\b"
+    rf"(?![.,]\d|\s*(?:руб|₽|тыс|%|час|дн|коп))",
+    re.IGNORECASE,
+)
+_AMOUNT = r"(?<![\w.,/–-])([-−]?(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?:[.,]\d+)?)(?![\w-])"
+_PRICE = re.compile(_AMOUNT + r"\s*(?:руб|₽)", re.IGNORECASE)
+_STOCK = re.compile(_AMOUNT + r"\s*(?:шт|единиц)", re.IGNORECASE)
+_PRICE_LABEL = re.compile(r"(?:цен[ауы]|стоимость|стоит)\s*[:—–-]?\s*" + _AMOUNT, re.IGNORECASE)
+_STOCK_LABEL = re.compile(r"(?:остаток|в наличии|на складе)\s*[:—–-]?\s*" + _AMOUNT, re.IGNORECASE)
 
 
 def named_quantities(question: str) -> set[int]:
-    """Числа, которые пользователь назвал в вопросе, без цифр внутри кодов."""
-    text = _CODE_LIKE.sub(" ", question)
-    numbers = {int(raw) for raw in re.findall(r"(?<!\d)\d+(?!\d)", text)}
-    numbers |= {value for word, value in _NUMBER_WORDS.items() if re.search(rf"\b{word}\b", text.lower())}
-    return numbers
+    """Количество из позиции заказа или явно подписанного поля."""
+    counts = set()
+    for match in _ORDER_COUNT.finditer(question):
+        raw = (match["count"] or match["labelled"] or match["direct"]).lower()
+        raw = "".join(raw.split())
+        counts.add(int(raw) if raw.isdigit() else _NUMBER_WORDS[raw])
+    return counts
 
 
-def _digits(raw: str) -> str:
-    return re.sub(r"\D", "", raw)
+def _amount(raw: str) -> Decimal:
+    return Decimal("".join(raw.split()).replace(",", ".").replace("−", "-"))
 
 
-def ungrounded(answer: str, question: str, tool_text: str) -> list[str]:
-    """Коды, цены и остатки ответа, которых нет ни в вопросе, ни в результатах инструментов."""
+def ungrounded(answer: str, question: str, tool_text: str, steps: list[ToolStep]) -> list[str]:
+    """Сверяет коды с контекстом, а показания ERP — с полем соответствующего инструмента."""
     allowed_codes = set(find_codes(question)) | set(find_codes(tool_text))
-    allowed_numbers = set(re.findall(r"\d+", tool_text)) | set(re.findall(r"\d+", question))
     problems = [code for code in find_codes(answer) if code not in allowed_codes] + malformed_codes(answer)
-    for raw in _WITH_UNIT.findall(answer) + _AFTER_WORD.findall(answer):
-        if _digits(raw) not in allowed_numbers:
-            problems.append(_digits(raw))
+    for name, field, patterns in (
+        ("get_price", "price_rub", (_PRICE, _PRICE_LABEL)),
+        ("check_stock", "qty", (_STOCK, _STOCK_LABEL)),
+    ):
+        allowed = {
+            Decimal(str(step.result[field]))
+            for step in steps
+            if step.tool == name and not step.error and step.result and field in step.result
+        }
+        for pattern in patterns:
+            for raw in pattern.findall(answer):
+                if _amount(raw) not in allowed:
+                    problems.append(raw)
     return list(dict.fromkeys(problems))
 
 
@@ -271,7 +292,7 @@ def run_agent(
 
 def _finish(run: _Run, llm: LLMClient, messages: list[dict], answer: str) -> AgentResult:
     for attempt in range(2):
-        problems = ungrounded(answer, run.question, run.tool_text)
+        problems = ungrounded(answer, run.question, run.tool_text, run.steps)
         if not problems and answer:
             break
         if attempt == 1:
@@ -290,6 +311,21 @@ def _finish(run: _Run, llm: LLMClient, messages: list[dict], answer: str) -> Age
             }
         )
         answer = llm.chat(messages).content.strip()
+
+    price_only = _PRICE.fullmatch(answer.rstrip(". "))
+    if price_only and not any(code_type(code) == "Part" for code in find_codes(run.question)):
+        price = _amount(price_only.group(1))
+        parts = {
+            step.result["part_id"]
+            for step in run.steps
+            if step.tool == "get_price"
+            and not step.error
+            and step.result
+            and step.result.get("price_rub") == price
+            and step.result.get("part_id")
+        }
+        if len(parts) == 1:
+            answer = f"{parts.pop()}: {answer}"
 
     if run.erp_failed and "не удалось" not in answer.lower():
         answer = f"{answer} {ERP_FAILED}".strip()
